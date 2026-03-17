@@ -20,14 +20,37 @@ import {
   Save,
   Trash2,
   History,
-  Clock
+  Clock,
+  GripVertical,
+  Library,
+  Sparkles
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // --- Types ---
 
+declare global {
+  interface Window {
+    aistudio?: {
+      hasSelectedApiKey: () => Promise<boolean>;
+      openSelectKey: () => Promise<void>;
+    };
+    process?: {
+      env: {
+        API_KEY?: string;
+        [key: string]: string | undefined;
+      };
+    };
+  }
+}
+
 type Resolution = "1K" | "2K" | "4K";
 type AspectRatio = "1:1" | "3:4" | "4:3" | "9:16" | "16:9";
+
+interface ReferenceImage {
+  id: string;
+  url: string;
+}
 
 interface GenerationResult {
   id: string;
@@ -45,7 +68,7 @@ interface Task {
   count: number;
   resolutions: Resolution[];
   aspectRatio: AspectRatio;
-  referenceImage?: string; // base64
+  referenceImages?: string[]; // base64 array
   status: 'pending' | 'running' | 'completed' | 'failed';
   progress: number;
   total: number;
@@ -53,61 +76,265 @@ interface Task {
   isEdit?: boolean;
 }
 
+interface PromptPreset {
+  id: string;
+  title: string;
+  content: string;
+  timestamp: number;
+}
+
+// --- IndexedDB Helpers ---
+
+const DB_NAME = 'NanoBananaDB';
+const STORE_NAME = 'results';
+const TASKS_STORE = 'tasks';
+const PRESETS_STORE = 'presets';
+
+const initDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 3); // Bump version to 3
+    request.onupgradeneeded = (e: any) => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(TASKS_STORE)) {
+        db.createObjectStore(TASKS_STORE, { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains(PRESETS_STORE)) {
+        db.createObjectStore(PRESETS_STORE, { keyPath: 'id' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+};
+
+const dbSaveTasks = async (tasks: Task[]) => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(TASKS_STORE, 'readwrite');
+    const store = tx.objectStore(TASKS_STORE);
+    store.clear();
+    tasks.forEach(task => store.put(task));
+    return new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error('Failed to save tasks to IndexedDB:', err);
+  }
+};
+
+const dbGetTasks = async (): Promise<Task[]> => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(TASKS_STORE, 'readonly');
+    const store = tx.objectStore(TASKS_STORE);
+    const request = store.getAll();
+    return new Promise((resolve) => {
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => resolve([]);
+    });
+  } catch (err) {
+    console.error('Failed to get tasks from IndexedDB:', err);
+    return [];
+  }
+};
+
+const dbSavePresets = async (presets: PromptPreset[]) => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(PRESETS_STORE, 'readwrite');
+    const store = tx.objectStore(PRESETS_STORE);
+    store.clear();
+    presets.forEach(p => store.put(p));
+  } catch (err) {
+    console.error('Failed to save presets to IndexedDB:', err);
+  }
+};
+
+const dbGetPresets = async (): Promise<PromptPreset[]> => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(PRESETS_STORE, 'readonly');
+    const store = tx.objectStore(PRESETS_STORE);
+    const request = store.getAll();
+    return new Promise((resolve) => {
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => resolve([]);
+    });
+  } catch (err) {
+    console.error('Failed to get presets from IndexedDB:', err);
+    return [];
+  }
+};
+
+const dbSaveResult = async (result: GenerationResult) => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(result);
+  } catch (err) {
+    console.error('Failed to save to IndexedDB:', err);
+  }
+};
+
+const dbGetAllResults = async (): Promise<GenerationResult[]> => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const store = tx.objectStore(STORE_NAME);
+    const request = store.getAll();
+    return new Promise((resolve) => {
+      request.onsuccess = () => {
+        const sorted = (request.result as GenerationResult[]).sort((a, b) => b.timestamp - a.timestamp);
+        resolve(sorted);
+      };
+      request.onerror = () => resolve([]);
+    });
+  } catch (err) {
+    console.error('Failed to get from IndexedDB:', err);
+    return [];
+  }
+};
+
+const dbClearResults = async () => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).clear();
+  } catch (err) {
+    console.error('Failed to clear IndexedDB:', err);
+  }
+};
+
+const dbDeleteResult = async (id: string) => {
+  try {
+    const db = await initDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(id);
+  } catch (err) {
+    console.error('Failed to delete from IndexedDB:', err);
+  }
+};
+
 // --- Components ---
 
 const App: React.FC = () => {
   // --- State ---
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('gemini_api_key') || '');
-  const [showKeyInput, setShowKeyInput] = useState<boolean>(!localStorage.getItem('gemini_api_key'));
+  const [showKeyInput, setShowKeyInput] = useState<boolean>(false);
+  const [hasPlatformKey, setHasPlatformKey] = useState<boolean>(false);
+  const [notification, setNotification] = useState<{ message: string, type: 'error' | 'success' } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ message: string, onConfirm: () => void } | null>(null);
   
   const [prompt, setPrompt] = useState<string>('');
   const [count, setCount] = useState<number>(1);
   const [selectedResolutions, setSelectedResolutions] = useState<Resolution[]>(["2K"]);
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>("1:1");
-  const [referenceImage, setReferenceImage] = useState<string | null>(null);
-  
+  const [referenceImages, setReferenceImages] = useState<ReferenceImage[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [results, setResults] = useState<GenerationResult[]>([]);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const isProcessingRef = useRef(false);
+  
+  const [promptPresets, setPromptPresets] = useState<PromptPreset[]>([]);
+  const [isPromptDrawerOpen, setIsPromptDrawerOpen] = useState<boolean>(false);
+  const [newPresetTitle, setNewPresetTitle] = useState<string>('');
+  const [newPresetContent, setNewPresetContent] = useState<string>('');
   
   const [selectedImage, setSelectedImage] = useState<GenerationResult | null>(null);
-  const [editingImage, setEditingImage] = useState<GenerationResult | null>(null);
+  const [editingImage, setEditingImage] = useState<{ url: string; prompt?: string } | null>(null);
   
   // --- Refs ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const editorContainerRef = useRef<HTMLDivElement>(null);
   const isDrawing = useRef<boolean>(false);
+
+  // --- Persistence ---
+  useEffect(() => {
+    const checkKey = async () => {
+      if (window.aistudio?.hasSelectedApiKey) {
+        const hasKey = await window.aistudio.hasSelectedApiKey();
+        setHasPlatformKey(hasKey);
+      }
+    };
+    checkKey();
+  }, []);
+
+  useEffect(() => {
+    const loadResults = async () => {
+      const [savedResults, savedTasks, savedPresets] = await Promise.all([
+        dbGetAllResults(),
+        dbGetTasks(),
+        dbGetPresets()
+      ]);
+      setResults(savedResults);
+      setTasks(savedTasks);
+      setPromptPresets(savedPresets);
+      
+      // Clean up old localStorage data
+      localStorage.removeItem('nanobanana_tasks');
+    };
+    loadResults();
+  }, []);
+
+  useEffect(() => {
+    dbSaveTasks(tasks);
+  }, [tasks]);
+
+  useEffect(() => {
+    dbSavePresets(promptPresets);
+  }, [promptPresets]);
 
   // --- Queue Processing ---
   useEffect(() => {
     const processQueue = async () => {
-      if (isProcessing) return;
+      if (isProcessingRef.current) return;
       
       const nextTask = tasks.find(t => t.status === 'pending');
       if (!nextTask) return;
 
-      setIsProcessing(true);
-      
-      // Update task status to running
-      setTasks(prev => prev.map(t => t.id === nextTask.id ? { ...t, status: 'running' } : t));
-
       try {
-        const ai = new GoogleGenAI({ apiKey });
+        isProcessingRef.current = true;
+        setIsProcessing(true);
+        
+        // Update task status to running
+        setTasks(prev => prev.map(t => t.id === nextTask.id ? { ...t, status: 'running' } : t));
+
+        // Create a new instance right before the call to get the latest key
+        const currentApiKey = window.process?.env?.API_KEY || apiKey;
+        
+        if (!currentApiKey && !hasPlatformKey) {
+          throw new Error("请先设置 API 密钥或选择平台密钥");
+        }
+
+        const ai = new GoogleGenAI({ apiKey: currentApiKey || '' });
         
         for (const res of nextTask.resolutions) {
           for (let i = 0; i < nextTask.count; i++) {
-            const parts: any[] = [{ text: nextTask.prompt }];
+            const parts: any[] = [];
             
-            if (nextTask.referenceImage) {
-              parts.unshift({
-                inlineData: {
-                  data: nextTask.referenceImage.split(',')[1],
-                  mimeType: 'image/png'
+            if (nextTask.referenceImages && nextTask.referenceImages.length > 0) {
+              nextTask.referenceImages.forEach(imgBase64 => {
+                const mimeType = imgBase64.split(';')[0].split(':')[1] || 'image/png';
+                const data = imgBase64.split(',')[1];
+                if (data) {
+                  parts.push({
+                    inlineData: {
+                      data,
+                      mimeType
+                    }
+                  });
                 }
               });
             }
 
+            parts.push({ text: nextTask.prompt });
+
             const response = await ai.models.generateContent({
-              model: 'gemini-3-pro-image-preview',
+              model: 'gemini-3.1-flash-image-preview',
               contents: { parts },
               config: {
                 imageConfig: {
@@ -118,7 +345,11 @@ const App: React.FC = () => {
             });
 
             let imageUrl = '';
-            for (const part of response.candidates?.[0]?.content?.parts || []) {
+            if (!response.candidates || response.candidates.length === 0 || !response.candidates[0].content || !response.candidates[0].content.parts) {
+              throw new Error("模型未返回有效结果，请检查提示词或 API 状态");
+            }
+
+            for (const part of response.candidates[0].content.parts) {
               if (part.inlineData) {
                 imageUrl = `data:image/png;base64,${part.inlineData.data}`;
                 break;
@@ -136,6 +367,7 @@ const App: React.FC = () => {
                 isEdit: nextTask.isEdit
               };
               setResults(prev => [result, ...prev]);
+              await dbSaveResult(result);
             }
             
             setTasks(prev => prev.map(t => 
@@ -149,14 +381,18 @@ const App: React.FC = () => {
         setTasks(prev => prev.map(t => t.id === nextTask.id ? { ...t, status: 'completed' } : t));
       } catch (err: any) {
         console.error("Task error:", err);
+        if (err.message?.includes("Requested entity was not found")) {
+          setHasPlatformKey(false);
+        }
         setTasks(prev => prev.map(t => t.id === nextTask.id ? { ...t, status: 'failed', error: err.message } : t));
       } finally {
+        isProcessingRef.current = false;
         setIsProcessing(false);
       }
     };
 
     processQueue();
-  }, [tasks, isProcessing, apiKey]);
+  }, [tasks, apiKey, hasPlatformKey]);
 
   // --- Handlers ---
   const handleSaveKey = () => {
@@ -164,10 +400,87 @@ const App: React.FC = () => {
     setShowKeyInput(false);
   };
 
+  const clearAllHistory = async () => {
+    setConfirmModal({
+      message: '确定要清空所有生成历史吗？此操作不可撤销。',
+      onConfirm: async () => {
+        setResults([]);
+        await dbClearResults();
+        setNotification({ message: '历史已清空', type: 'success' });
+      }
+    });
+  };
+
+  const deleteSingleResult = async (id: string) => {
+    setResults(prev => prev.filter(r => r.id !== id));
+    await dbDeleteResult(id);
+  };
+
+  const addReferenceImage = (url: string) => {
+    if (referenceImages.length >= 3) {
+      setNotification({ message: '最多支持3张参考图', type: 'error' });
+      return;
+    }
+    setReferenceImages(prev => [...prev, { id: Math.random().toString(36).substring(7), url }]);
+  };
+
+  const addPromptPreset = () => {
+    if (!newPresetTitle.trim() || !newPresetContent.trim()) {
+      setNotification({ message: '标题和内容不能为空', type: 'error' });
+      return;
+    }
+    const newPreset: PromptPreset = {
+      id: Math.random().toString(36).substring(7),
+      title: newPresetTitle,
+      content: newPresetContent,
+      timestamp: Date.now()
+    };
+    setPromptPresets(prev => [newPreset, ...prev]);
+    setNewPresetTitle('');
+    setNewPresetContent('');
+    setNotification({ message: '提示词已保存', type: 'success' });
+  };
+
+  const deletePromptPreset = (id: string) => {
+    setPromptPresets(prev => prev.filter(p => p.id !== id));
+    setNotification({ message: '提示词已删除', type: 'success' });
+  };
+
+  const usePromptPreset = (content: string) => {
+    setPrompt(content);
+    setIsPromptDrawerOpen(false);
+    setNotification({ message: '已应用提示词', type: 'success' });
+  };
+
+  const removeReferenceImage = (id: string) => {
+    setReferenceImages(prev => prev.filter(img => img.id !== id));
+  };
+
+  const handleOpenSelectKey = async () => {
+    if (window.aistudio?.openSelectKey) {
+      await window.aistudio.openSelectKey();
+      setHasPlatformKey(true);
+    }
+  };
+
+  const deleteTask = (id: string) => {
+    setTasks(prev => prev.filter(t => t.id !== id));
+  };
+
+  const retryTask = (id: string) => {
+    setTasks(prev => prev.map(t => t.id === id ? { ...t, status: 'pending', progress: 0, error: undefined } : t));
+  };
+
   const addTask = (isEdit = false, customImage?: string) => {
     if (!prompt.trim() && !isEdit) return;
-    if (!apiKey) {
-      setShowKeyInput(true);
+    
+    const currentApiKey = window.process?.env?.API_KEY || apiKey;
+    if (!currentApiKey && !hasPlatformKey) {
+      if (window.aistudio?.openSelectKey) {
+        handleOpenSelectKey();
+      } else {
+        setShowKeyInput(true);
+      }
       return;
     }
 
@@ -177,7 +490,7 @@ const App: React.FC = () => {
       count: isEdit ? 1 : count,
       resolutions: selectedResolutions,
       aspectRatio: aspectRatio,
-      referenceImage: customImage || referenceImage || undefined,
+      referenceImages: isEdit ? (customImage ? [customImage] : []) : referenceImages.map(img => img.url),
       status: 'pending',
       progress: 0,
       total: (isEdit ? 1 : count) * selectedResolutions.length,
@@ -189,13 +502,16 @@ const App: React.FC = () => {
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setReferenceImage(reader.result as string);
-      };
-      reader.readAsDataURL(file);
+    const files = e.target.files;
+    if (files) {
+      (Array.from(files) as File[]).forEach(file => {
+        if (referenceImages.length >= 3) return;
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          addReferenceImage(reader.result as string);
+        };
+        reader.readAsDataURL(file);
+      });
     }
   };
 
@@ -375,7 +691,7 @@ const App: React.FC = () => {
                 </button>
               </div>
               
-              <div className="flex-1 relative bg-black flex items-center justify-center overflow-hidden">
+              <div ref={editorContainerRef} className="flex-1 relative bg-black flex items-center justify-center overflow-hidden">
                 <div className="relative inline-block">
                   <img 
                     src={editingImage.url} 
@@ -397,7 +713,16 @@ const App: React.FC = () => {
                     onTouchEnd={stopDrawing}
                   />
                 </div>
-                <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/80 backdrop-blur-md border border-white/10 rounded-2xl px-6 py-4 flex items-center gap-6">
+                <motion.div 
+                  drag
+                  dragConstraints={editorContainerRef}
+                  dragMomentum={false}
+                  className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-black/80 backdrop-blur-md border border-white/10 rounded-2xl px-4 py-4 flex items-center gap-4 shadow-2xl cursor-default z-50"
+                >
+                  <div className="cursor-grab active:cursor-grabbing text-zinc-600 hover:text-zinc-400 px-1">
+                    <GripVertical className="w-5 h-5" />
+                  </div>
+                  <div className="w-px h-8 bg-white/5" />
                   <div className="flex flex-col gap-2">
                     <label className="text-[10px] text-zinc-500 uppercase font-bold">画笔颜色</label>
                     <div className="flex gap-2">
@@ -433,14 +758,16 @@ const App: React.FC = () => {
                   <button 
                     onClick={() => {
                       const ctx = canvasRef.current?.getContext('2d');
-                      ctx?.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
+                      if (canvasRef.current) {
+                        ctx?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+                      }
                     }}
-                    className="text-xs text-zinc-500 hover:text-white flex flex-col items-center gap-1"
+                    className="text-xs text-zinc-500 hover:text-white flex flex-col items-center gap-1 min-w-[40px]"
                   >
                     <Eraser className="w-4 h-4" />
                     重置
                   </button>
-                </div>
+                </motion.div>
               </div>
 
               <div className="p-8 bg-[#161616] border-t border-white/5 space-y-4">
@@ -467,6 +794,173 @@ const App: React.FC = () => {
         )}
       </AnimatePresence>
 
+      {/* Prompt Drawer */}
+      <AnimatePresence>
+        {isPromptDrawerOpen && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsPromptDrawerOpen(false)}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[120]"
+            />
+            <motion.div
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+              className="fixed top-0 right-0 h-full w-full max-w-md bg-[#0a0a0a] border-l border-white/10 z-[130] shadow-2xl flex flex-col"
+            >
+              <div className="p-6 border-b border-white/5 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-8 h-8 bg-emerald-500/10 rounded-lg flex items-center justify-center">
+                    <History className="w-4 h-4 text-emerald-500" />
+                  </div>
+                  <h2 className="text-lg font-bold text-white">提示词库</h2>
+                </div>
+                <button 
+                  onClick={() => setIsPromptDrawerOpen(false)}
+                  className="p-2 hover:bg-white/5 rounded-full transition-colors"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-6 space-y-8 custom-scrollbar">
+                {/* Add New Preset Form */}
+                <div className="space-y-4">
+                  <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-widest">新增预设</h3>
+                  <div className="space-y-3 bg-white/5 p-4 rounded-2xl border border-white/5">
+                    <input
+                      type="text"
+                      value={newPresetTitle}
+                      onChange={(e) => setNewPresetTitle(e.target.value)}
+                      placeholder="预设名称 (如: 赛博朋克风格)"
+                      className="w-full bg-black border border-white/10 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500/50"
+                    />
+                    <textarea
+                      value={newPresetContent}
+                      onChange={(e) => setNewPresetContent(e.target.value)}
+                      placeholder="提示词内容..."
+                      rows={3}
+                      className="w-full bg-black border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500/50 resize-none"
+                    />
+                    <button
+                      onClick={addPromptPreset}
+                      className="w-full py-2.5 bg-emerald-500 text-black rounded-xl font-bold text-sm hover:bg-emerald-400 transition-all flex items-center justify-center gap-2"
+                    >
+                      <Plus className="w-4 h-4" />
+                      保存到库
+                    </button>
+                  </div>
+                </div>
+
+                {/* Presets List */}
+                <div className="space-y-4">
+                  <h3 className="text-xs font-bold text-zinc-500 uppercase tracking-widest">我的预设 ({promptPresets.length})</h3>
+                  <div className="space-y-3">
+                    {promptPresets.length === 0 ? (
+                      <div className="text-center py-12 border border-dashed border-white/5 rounded-2xl">
+                        <History className="w-8 h-8 text-zinc-800 mx-auto mb-3" />
+                        <p className="text-sm text-zinc-600">暂无保存的提示词</p>
+                      </div>
+                    ) : (
+                      promptPresets.map(preset => (
+                        <motion.div
+                          key={preset.id}
+                          layout
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          className="group bg-white/5 border border-white/5 rounded-2xl p-4 hover:border-emerald-500/30 transition-all cursor-pointer"
+                          onClick={() => usePromptPreset(preset.content)}
+                        >
+                          <div className="flex items-center justify-between mb-2">
+                            <h4 className="font-bold text-sm text-zinc-200 group-hover:text-emerald-400 transition-colors">{preset.title}</h4>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deletePromptPreset(preset.id);
+                              }}
+                              className="p-1.5 opacity-0 group-hover:opacity-100 hover:bg-red-500/20 rounded-lg transition-all"
+                            >
+                              <Trash2 className="w-3.5 h-3.5 text-red-400" />
+                            </button>
+                          </div>
+                          <p className="text-xs text-zinc-500 line-clamp-2 leading-relaxed">
+                            {preset.content}
+                          </p>
+                          <div className="mt-3 flex items-center justify-between text-[10px] text-zinc-600 font-medium uppercase tracking-tighter">
+                            <span>{new Date(preset.timestamp).toLocaleDateString()}</span>
+                            <span className="flex items-center gap-1 text-emerald-500/60">
+                              点击应用 <RefreshCw className="w-2.5 h-2.5" />
+                            </span>
+                          </div>
+                        </motion.div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Notification Toast */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div
+            initial={{ opacity: 0, y: 50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 50 }}
+            className={`fixed bottom-8 left-1/2 -translate-x-1/2 px-6 py-3 rounded-full shadow-2xl z-[100] flex items-center gap-3 border ${
+              notification.type === 'error' ? 'bg-red-500 border-red-400 text-white' : 'bg-emerald-500 border-emerald-400 text-black'
+            }`}
+          >
+            {notification.type === 'error' ? <AlertCircle className="w-5 h-5" /> : <CheckCircle2 className="w-5 h-5" />}
+            <span className="text-sm font-bold">{notification.message}</span>
+            <button onClick={() => setNotification(null)} className="ml-2 hover:opacity-70">
+              <X className="w-4 h-4" />
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Confirmation Modal */}
+      <AnimatePresence>
+        {confirmModal && (
+          <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[110] flex items-center justify-center p-6">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.9 }}
+              className="bg-zinc-900 border border-white/10 p-8 rounded-3xl max-w-md w-full shadow-2xl"
+            >
+              <h3 className="text-xl font-bold text-white mb-4">确认操作</h3>
+              <p className="text-zinc-400 mb-8 leading-relaxed">{confirmModal.message}</p>
+              <div className="flex gap-4">
+                <button
+                  onClick={() => setConfirmModal(null)}
+                  className="flex-1 py-3 bg-white/5 hover:bg-white/10 text-white rounded-xl font-bold transition-colors"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={() => {
+                    confirmModal.onConfirm();
+                    setConfirmModal(null);
+                  }}
+                  className="flex-1 py-3 bg-red-500 hover:bg-red-600 text-white rounded-xl font-bold transition-colors"
+                >
+                  确认
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Header */}
       <header className="border-b border-white/5 bg-black/50 backdrop-blur-md sticky top-0 z-50">
         <div className="max-w-7xl mx-auto px-6 h-16 flex items-center justify-between">
@@ -477,6 +971,15 @@ const App: React.FC = () => {
             <h1 className="font-semibold tracking-tight">NanoBananaPro <span className="text-zinc-500 font-normal">Studio</span></h1>
           </div>
           <div className="flex items-center gap-4">
+            {!hasPlatformKey && !apiKey && (
+              <button 
+                onClick={handleOpenSelectKey}
+                className="hidden md:flex items-center gap-2 px-4 py-2 bg-emerald-500 text-black rounded-full text-xs font-bold hover:bg-emerald-400 transition-colors"
+              >
+                <Key className="w-4 h-4" />
+                激活 Pro 模型
+              </button>
+            )}
             <div className="hidden md:flex items-center gap-2 px-3 py-1.5 bg-white/5 rounded-full border border-white/5">
               <div className={`w-2 h-2 rounded-full ${isProcessing ? 'bg-emerald-500 animate-pulse' : 'bg-zinc-700'}`} />
               <span className="text-[10px] font-medium text-zinc-400 uppercase tracking-widest">
@@ -484,11 +987,22 @@ const App: React.FC = () => {
               </span>
             </div>
             <button 
+              onClick={() => setIsPromptDrawerOpen(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full transition-all relative group"
+            >
+              <Library className="w-4 h-4 text-emerald-500 group-hover:scale-110 transition-transform" />
+              <span className="text-xs font-bold text-zinc-300">预设提示词</span>
+              {promptPresets.length > 0 && (
+                <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-emerald-500 rounded-full border-2 border-black" />
+              )}
+            </button>
+            <button 
               onClick={() => setShowKeyInput(true)}
-              className="p-2 hover:bg-white/5 rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full transition-all group"
               title="设置 API 密钥"
             >
-              <Settings2 className="w-5 h-5 text-zinc-400" />
+              <Key className="w-4 h-4 text-zinc-400 group-hover:text-emerald-500 transition-colors" />
+              <span className="text-xs font-bold text-zinc-300">API 设置</span>
             </button>
           </div>
         </div>
@@ -509,29 +1023,56 @@ const App: React.FC = () => {
                 placeholder="描述你想要生成的画面..."
                 className="w-full h-24 bg-black border border-white/10 rounded-xl p-4 text-sm focus:outline-none focus:border-emerald-500/50 transition-colors resize-none placeholder:text-zinc-700"
               />
+              {referenceImages.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {referenceImages.map((_, index) => (
+                    <button
+                      key={index}
+                      onClick={() => setPrompt(prev => prev.trim() + ` @图${index + 1} `)}
+                      className="px-2 py-1 bg-white/5 border border-white/10 rounded text-[10px] text-zinc-400 hover:bg-emerald-500/20 hover:text-emerald-400 transition-colors flex items-center gap-1"
+                    >
+                      <ImageIcon className="w-3 h-3" />
+                      引用图 {index + 1}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="space-y-3">
               <label className="text-xs font-medium text-zinc-500 uppercase tracking-wider flex items-center gap-2">
                 <Upload className="w-3 h-3" />
-                参考图 (Optional)
+                参考图 (最多3张)
               </label>
-              <div className="relative group">
-                {referenceImage ? (
-                  <div className="relative aspect-video rounded-xl overflow-hidden border border-white/10">
-                    <img src={referenceImage} alt="Ref" className="w-full h-full object-cover" />
-                    <button 
-                      onClick={() => setReferenceImage(null)}
-                      className="absolute top-2 right-2 p-1.5 bg-black/60 backdrop-blur-md rounded-lg hover:bg-red-500 transition-colors"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
+              <div className="grid grid-cols-3 gap-3">
+                {referenceImages.map((img, index) => (
+                  <div key={img.id} className="relative aspect-square rounded-xl overflow-hidden border border-white/10 group/ref">
+                    <img src={img.url} alt={`Ref ${index + 1}`} className="w-full h-full object-cover" />
+                    <div className="absolute inset-0 bg-black/60 opacity-0 group-hover/ref:opacity-100 transition-opacity flex flex-col items-center justify-center gap-2">
+                      <button 
+                        onClick={() => setEditingImage({ url: img.url })}
+                        className="p-1.5 bg-emerald-500 text-black rounded-lg hover:bg-emerald-400 transition-colors"
+                        title="编辑"
+                      >
+                        <Brush className="w-3.5 h-3.5" />
+                      </button>
+                      <button 
+                        onClick={() => removeReferenceImage(img.id)}
+                        className="p-1.5 bg-red-500 text-white rounded-lg hover:bg-red-400 transition-colors"
+                        title="移除"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                    <div className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-black/60 backdrop-blur-md rounded text-[8px] text-white font-bold border border-white/10">
+                      图 {index + 1}
+                    </div>
                   </div>
-                ) : (
-                  <label className="flex flex-col items-center justify-center aspect-video border border-dashed border-white/10 rounded-xl cursor-pointer hover:bg-white/5 transition-colors">
-                    <Upload className="w-6 h-6 text-zinc-600 mb-2" />
-                    <span className="text-[10px] text-zinc-500 uppercase font-medium">点击上传参考图</span>
-                    <input type="file" accept="image/*" className="hidden" onChange={handleFileUpload} />
+                ))}
+                {referenceImages.length < 3 && (
+                  <label className="flex flex-col items-center justify-center aspect-square border border-dashed border-white/10 rounded-xl cursor-pointer hover:bg-white/5 transition-colors group">
+                    <Plus className="w-5 h-5 text-zinc-600 group-hover:text-zinc-400 transition-colors" />
+                    <input type="file" accept="image/*" className="hidden" multiple onChange={handleFileUpload} />
                   </label>
                 )}
               </div>
@@ -574,11 +1115,7 @@ const App: React.FC = () => {
                 {(["1K", "2K", "4K"] as Resolution[]).map((res) => (
                   <button
                     key={res}
-                    onClick={() => setSelectedResolutions(prev => 
-                      prev.includes(res) 
-                        ? (prev.length > 1 ? prev.filter(r => r !== res) : prev)
-                        : [...prev, res]
-                    )}
+                    onClick={() => setSelectedResolutions([res])}
                     className={`px-4 py-2 rounded-lg text-xs font-medium transition-all ${
                       selectedResolutions.includes(res)
                         ? "bg-emerald-500 text-black shadow-[0_0_15px_rgba(16,185,129,0.3)]"
@@ -628,15 +1165,27 @@ const App: React.FC = () => {
                         <div className="flex items-center gap-2">
                           {task.status === 'running' && <Loader2 className="w-3 h-3 text-emerald-500 animate-spin" />}
                           {task.status === 'completed' && <CheckCircle2 className="w-3 h-3 text-emerald-500" />}
-                          {task.status === 'failed' && <AlertCircle className="w-3 h-3 text-red-500" />}
+                          {task.status === 'failed' && (
+                            <button 
+                              onClick={() => retryTask(task.id)}
+                              className="p-1 hover:bg-white/10 rounded transition-colors"
+                              title="重试"
+                            >
+                              <RefreshCw className="w-3 h-3 text-red-400" />
+                            </button>
+                          )}
                           <button 
-                            onClick={() => setTasks(prev => prev.filter(t => t.id !== task.id))}
-                            className="p-1 hover:bg-white/10 rounded"
+                            onClick={() => deleteTask(task.id)}
+                            className="p-1 hover:bg-white/10 rounded transition-colors"
+                            title="删除"
                           >
                             <Trash2 className="w-3 h-3 text-zinc-600 hover:text-red-400" />
                           </button>
                         </div>
                       </div>
+                      {task.status === 'failed' && task.error && (
+                        <p className="text-[8px] text-red-400/80 mb-2 line-clamp-1">{task.error}</p>
+                      )}
                       <div className="h-1 bg-white/5 rounded-full overflow-hidden">
                         <motion.div 
                           initial={{ width: 0 }}
@@ -667,7 +1216,7 @@ const App: React.FC = () => {
             </h2>
             {results.length > 0 && (
               <button 
-                onClick={() => setResults([])}
+                onClick={clearAllHistory}
                 className="text-xs text-zinc-500 hover:text-red-400 transition-colors flex items-center gap-1"
               >
                 <History className="w-3 h-3" />
@@ -714,8 +1263,23 @@ const App: React.FC = () => {
                         <button 
                           onClick={(e) => { e.stopPropagation(); setEditingImage(result); }}
                           className="p-3 bg-emerald-500 text-black rounded-full hover:scale-110 transition-transform"
+                          title="编辑图片"
                         >
                           <Brush className="w-5 h-5" />
+                        </button>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); addReferenceImage(result.url); }}
+                          className="p-3 bg-blue-500 text-white rounded-full hover:scale-110 transition-transform"
+                          title="设为参考图"
+                        >
+                          <Layers className="w-5 h-5" />
+                        </button>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); deleteSingleResult(result.id); }}
+                          className="p-3 bg-red-500 text-white rounded-full hover:scale-110 transition-transform"
+                          title="删除图片"
+                        >
+                          <Trash2 className="w-5 h-5" />
                         </button>
                       </div>
                     </div>
