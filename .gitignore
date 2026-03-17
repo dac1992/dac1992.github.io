@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+# Allow build artifacts in root for GitHub Pages
+!/index.html
+!/assets/
