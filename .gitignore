@@ -1,7 +1,16 @@
 node_modules/
 build/
+dist/
 coverage/
 .DS_Store
 *.log
 .env*
 !.env.example
+package-lock.json
+src/
+.git/
+vite.config.ts
+tsconfig.json
+types.d.ts
+dist
+
