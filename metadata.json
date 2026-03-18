@@ -1,5 +1,0 @@
-{
-  "name": "NanoBananaPro 批量生图",
-  "description": "使用 Gemini 3 Pro Image (NanoBananaPro) 大模型进行批量高质量图片生成，支持多种分辨率和尺寸选择。",
-  "requestFramePermissions": []
-}
